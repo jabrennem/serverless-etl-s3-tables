@@ -115,6 +115,33 @@ Resources:
     Properties:
       TableBucketName: !Ref TableBucketName
 
+  IcebergDefaultNamespace:
+    Type: AWS::S3Tables::Namespace
+    Properties:
+      TableBucketARN: !GetAtt IcebergTableBucket.TableBucketARN
+      Namespace: default
+
+  IcebergTestDataTable:
+    Type: AWS::S3Tables::Table
+    DependsOn: IcebergDefaultNamespace
+    Properties:
+      TableBucketARN: !GetAtt IcebergTableBucket.TableBucketARN
+      Namespace: default
+      TableName: test_data
+      OpenTableFormat: ICEBERG
+      IcebergMetadata:
+        IcebergSchema:
+          SchemaFieldList:
+            - Name: id
+              Type: long
+              Required: true
+            - Name: name
+              Type: string
+              Required: false
+            - Name: amount
+              Type: double
+              Required: false
+
   # -- EMR Serverless Application --
 
   EmrApp:
@@ -205,6 +232,12 @@ Resources:
               - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/${TableBucketName}"
               - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/${TableBucketName}/*"
               - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/${TableBucketName}/*"
+          - Sid: LakeFormationDataAccess
+            Effect: Allow
+            Action:
+              - lakeformation:GetDataAccess
+            Resource: "*"
+
 
   # --- Load Data State Machine ---
 

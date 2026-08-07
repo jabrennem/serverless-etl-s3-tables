@@ -77,6 +77,43 @@ aws s3 cp "/tmp/s3-tables-catalog-for-iceberg-runtime-${S3_TABLES_CATALOG_VERSIO
   --profile "$PROFILE"
 ```
 
+### Lake Formation Grants (Post-Deploy)
+
+If your account has Lake Formation enabled with restrictive settings (i.e. `IAMAllowedPrincipals` removed from default permissions), run these once after deploying. The CloudFormation `PrincipalPermissions` resource doesn't support compound catalog IDs used by S3 Table Buckets, so these must be applied via CLI:
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile "$PROFILE")
+TABLE_BUCKET_NAME='serverless-etl-table-bucket'
+EMR_ROLE=$(aws cloudformation describe-stack-resource \
+  --stack-name "$STACK_NAME" \
+  --logical-resource-id EmrAppRole \
+  --query 'StackResourceDetail.PhysicalResourceId' \
+  --output text \
+  --profile "$PROFILE")
+EMR_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EMR_ROLE}"
+
+# Catalog-level (namespace discovery)
+aws lakeformation grant-permissions \
+  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
+  --resource "{\"Catalog\":{\"Id\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\"}}" \
+  --permissions '["CREATE_DATABASE", "DESCRIBE"]' \
+  --profile "$PROFILE"
+
+# Database-level (default namespace)
+aws lakeformation grant-permissions \
+  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
+  --resource "{\"Database\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\",\"Name\":\"default\"}}" \
+  --permissions '["DESCRIBE", "ALTER", "CREATE_TABLE"]' \
+  --profile "$PROFILE"
+
+# Table-level (all tables in default namespace)
+aws lakeformation grant-permissions \
+  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
+  --resource "{\"Table\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\",\"DatabaseName\":\"default\",\"TableWildcard\":{}}}" \
+  --permissions '["SELECT", "INSERT", "DESCRIBE", "ALTER", "DROP"]' \
+  --profile "$PROFILE"
+```
+
 ## Run
 
 Upload a Parquet file to the `feed/` prefix to trigger the pipeline:

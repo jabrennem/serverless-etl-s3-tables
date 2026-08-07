@@ -63,11 +63,9 @@ def main(input_path: str, catalog_id: str, namespace: str,
     print(f"Found {count} records")
     df.printSchema()
 
-    # Create namespace if it doesn't exist
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS s3tablesbucket.{namespace}")
-
-    # Write data — create or replace table
-    df.writeTo(iceberg_table).createOrReplace()
+    # Write data — overwrite the pre-existing table
+    df.createOrReplaceTempView("source_data")
+    spark.sql(f"INSERT OVERWRITE {iceberg_table} SELECT * FROM source_data")
     print(f"Data successfully written to '{iceberg_table}' ({count} rows)")
 
     if stats_s3_uri:
