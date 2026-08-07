@@ -7,7 +7,7 @@ from pyspark.sql import SparkSession
 def _write_stats_file(
     stats_s3_uri: str,
     input_path: str,
-    table_bucket_name: str,
+    catalog_id: str,
     namespace: str,
     table_name: str,
     row_count: int,
@@ -23,7 +23,7 @@ def _write_stats_file(
                 "table": table_name,
                 "rowCount": row_count,
                 "input": input_path.removeprefix("s3://"),
-                "output": f"{table_bucket_name}/{namespace}.{table_name}",
+                "output": f"{catalog_id}/{namespace}.{table_name}",
             }).encode(),
         )
         print(f"Stats written to {stats_s3_uri} ({row_count} rows)")
@@ -31,13 +31,13 @@ def _write_stats_file(
         print(f"Warning: failed to write stats file: {e}")
 
 
-def main(input_path: str, table_bucket_name: str, namespace: str,
+def main(input_path: str, catalog_id: str, namespace: str,
          table_name: str, stats_s3_uri: str = "") -> int:
-    """Load a Parquet file from S3 into an S3 Table Bucket (managed Iceberg).
+    """Load a Parquet file from S3 into an S3 Table Bucket (managed Iceberg) via Glue REST catalog.
 
     Args:
         input_path: S3 path to the source Parquet file.
-        table_bucket_name: Name of the S3 Table Bucket.
+        catalog_id: Glue catalog ID for the S3 Table Bucket (e.g. 123456789012:s3tablescatalog/bucket-name).
         namespace: Namespace within the table bucket.
         table_name: Name of the target table.
         stats_s3_uri: S3 URI to write run stats JSON (optional).
@@ -48,15 +48,11 @@ def main(input_path: str, table_bucket_name: str, namespace: str,
     iceberg_table = f"s3tablesbucket.{namespace}.{table_name}"
 
     print(f"Loading {input_path} into {iceberg_table}")
-    print(f"Table bucket: {table_bucket_name}")
+    print(f"Glue catalog ID: {catalog_id}")
 
     spark = (
         SparkSession.builder
         .appName(f"S3TableBucket-Import-{table_name}")
-        .config("spark.sql.catalog.s3tablesbucket", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.s3tablesbucket.catalog-impl", "software.amazon.s3tables.iceberg.S3TablesCatalog")
-        .config("spark.sql.catalog.s3tablesbucket.warehouse", table_bucket_name)
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .getOrCreate()
     )
 
@@ -75,7 +71,7 @@ def main(input_path: str, table_bucket_name: str, namespace: str,
     print(f"Data successfully written to '{iceberg_table}' ({count} rows)")
 
     if stats_s3_uri:
-        _write_stats_file(stats_s3_uri, input_path, table_bucket_name, namespace, table_name, count)
+        _write_stats_file(stats_s3_uri, input_path, catalog_id, namespace, table_name, count)
 
     spark.stop()
     return 0
@@ -84,7 +80,7 @@ def main(input_path: str, table_bucket_name: str, namespace: str,
 if __name__ == "__main__":
     print(sys.argv)
     if len(sys.argv) < 5:
-        print("Usage: load_data.py <input_path> <table_bucket_name> <namespace> <table_name> [stats_s3_uri]")
+        print("Usage: load_data.py <input_path> <catalog_id> <namespace> <table_name> [stats_s3_uri]")
         sys.exit(1)
     stats_s3_uri = sys.argv[5] if len(sys.argv) > 5 else ""
     sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], stats_s3_uri))

@@ -186,6 +186,25 @@ Resources:
             Resource:
               - !GetAtt IcebergTableBucket.TableBucketARN
               - !Sub "${IcebergTableBucket.TableBucketARN}/*"
+          - Sid: GlueIcebergCatalog
+            Effect: Allow
+            Action:
+              - glue:GetCatalog
+              - glue:GetCatalogs
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:CreateDatabase
+              - glue:GetTable
+              - glue:GetTables
+              - glue:CreateTable
+              - glue:UpdateTable
+              - glue:DeleteTable
+            Resource:
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/${TableBucketName}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/${TableBucketName}/*"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/${TableBucketName}/*"
 
   # --- Load Data State Machine ---
 
@@ -206,7 +225,8 @@ Resources:
         EMRServerlessApplicationId: !Ref EmrApp
         ExecutionRoleArn: !GetAtt EmrAppRole.Arn
         PySparkScriptLocation: !Sub "s3://${DataBucket}/emr/load_data.py"
-        IcebergTableBucketName: !Ref TableBucketName
+        GlueCatalogId: !Sub "${AWS::AccountId}:s3tablescatalog/${TableBucketName}"
+        "AWS::Region": !Ref "AWS::Region"
 
   StateMachineRole:
     Type: AWS::IAM::Role

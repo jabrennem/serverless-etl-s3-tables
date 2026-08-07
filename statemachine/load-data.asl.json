@@ -33,8 +33,8 @@
                             "JobDriver": {
                                 "SparkSubmit": {
                                     "EntryPoint": "${PySparkScriptLocation}",
-                                    "EntryPointArguments": "{% [ 's3://${DataBucket}/' & $states.input.SourceFile, '${IcebergTableBucketName}', 'default', $states.input.TableName, 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' ] %}",
-                                    "SparkSubmitParameters": "--conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.s3tablesbucket=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.s3tablesbucket.catalog-impl=software.amazon.s3tables.iceberg.S3TablesCatalog --conf spark.sql.catalog.s3tablesbucket.warehouse=${IcebergTableBucketName}"
+                                    "EntryPointArguments": "{% [ 's3://${DataBucket}/' & $states.input.SourceFile, '${GlueCatalogId}', 'default', $states.input.TableName, 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' ] %}",
+                                    "SparkSubmitParameters": "--conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.s3tablesbucket=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.s3tablesbucket.type=rest --conf spark.sql.catalog.s3tablesbucket.uri=https://glue.${AWS::Region}.amazonaws.com/iceberg --conf spark.sql.catalog.s3tablesbucket.warehouse=${GlueCatalogId} --conf spark.sql.catalog.s3tablesbucket.rest.sigv4-enabled=true --conf spark.sql.catalog.s3tablesbucket.rest.signing-name=glue --conf spark.sql.catalog.s3tablesbucket.rest.signing-region=${AWS::Region}"
                                 }
                             }
                         },
