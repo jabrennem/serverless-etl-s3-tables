@@ -16,7 +16,7 @@ flowchart LR
     SFN --> Event[EventBridge\nTableLoadComplete]
 ```
 
-### Data Layer
+### DataBucket File Directory
 
 | Path | Purpose |
 |------|---------|
@@ -46,80 +46,39 @@ flowchart LR
 
 ## Build and Deploy
 
-```bash
-PROFILE='dev'
-STACK_NAME='serverless-etl-s3-to-iceberg'
+Set `AWS_PROFILE` to override the default profile (`dev`).
 
-# Build and deploy the SAM stack
+```bash
+AWS_PROFILE=profile_name
+```
+
+Build and deploy
+
+```bash
 sam build
 sam deploy
-
-# Grab the data bucket name from stack outputs
-aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs" \
-  --output json \
-  --profile "$PROFILE" > stack-outputs.json
-
-DATA_BUCKET=$(jq -r '.[] | select(.OutputKey=="DataBucketName") | .OutputValue' stack-outputs.json)
-
-# Upload the PySpark script
-aws s3 cp emr/load_data.py "s3://${DATA_BUCKET}/emr/load_data.py" --profile "$PROFILE"
-
-# Download and upload the S3 Tables Catalog for Iceberg runtime JAR
-# (not bundled with EMR Serverless — required for software.amazon.s3tables.iceberg.S3TablesCatalog)
-S3_TABLES_CATALOG_VERSION='0.1.8'
-curl -sL -o "/tmp/s3-tables-catalog-for-iceberg-runtime-${S3_TABLES_CATALOG_VERSION}.jar" \
-  "https://repo1.maven.org/maven2/software/amazon/s3tables/s3-tables-catalog-for-iceberg-runtime/${S3_TABLES_CATALOG_VERSION}/s3-tables-catalog-for-iceberg-runtime-${S3_TABLES_CATALOG_VERSION}.jar"
-
-aws s3 cp "/tmp/s3-tables-catalog-for-iceberg-runtime-${S3_TABLES_CATALOG_VERSION}.jar" \
-  "s3://${DATA_BUCKET}/emr/jars/s3-tables-catalog-for-iceberg-runtime-${S3_TABLES_CATALOG_VERSION}.jar" \
-  --profile "$PROFILE"
 ```
 
-### Lake Formation Grants (Post-Deploy)
-
-If your account has Lake Formation enabled with restrictive settings (i.e. `IAMAllowedPrincipals` removed from default permissions), run these once after deploying. The CloudFormation `PrincipalPermissions` resource doesn't support compound catalog IDs used by S3 Table Buckets, so these must be applied via CLI:
+Then run the post-deploy script to upload the PySpark script and apply Lake Formation grants:
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile "$PROFILE")
-TABLE_BUCKET_NAME='serverless-etl-table-bucket'
-EMR_ROLE=$(aws cloudformation describe-stack-resource \
-  --stack-name "$STACK_NAME" \
-  --logical-resource-id EmrAppRole \
-  --query 'StackResourceDetail.PhysicalResourceId' \
-  --output text \
-  --profile "$PROFILE")
-EMR_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EMR_ROLE}"
-
-# Catalog-level (namespace discovery)
-aws lakeformation grant-permissions \
-  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
-  --resource "{\"Catalog\":{\"Id\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\"}}" \
-  --permissions '["CREATE_DATABASE", "DESCRIBE"]' \
-  --profile "$PROFILE"
-
-# Database-level (default namespace)
-aws lakeformation grant-permissions \
-  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
-  --resource "{\"Database\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\",\"Name\":\"default\"}}" \
-  --permissions '["DESCRIBE", "ALTER", "CREATE_TABLE"]' \
-  --profile "$PROFILE"
-
-# Table-level (all tables in default namespace)
-aws lakeformation grant-permissions \
-  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
-  --resource "{\"Table\":{\"CatalogId\":\"${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}\",\"DatabaseName\":\"default\",\"TableWildcard\":{}}}" \
-  --permissions '["SELECT", "INSERT", "DESCRIBE", "ALTER", "DROP"]' \
-  --profile "$PROFILE"
+./scripts/post-deploy.sh
 ```
+
+### Lake Formation Grants
+
+If your account has Lake Formation enabled with restrictive settings (i.e. `IAMAllowedPrincipals` removed from default permissions), the post-deploy script applies the necessary grants automatically. The CloudFormation `PrincipalPermissions` resource doesn't support compound catalog IDs used by S3 Table Buckets, so these are applied via CLI. The grants are idempotent — safe to re-run.
 
 ## Run
 
-Upload a Parquet file to the `feed/` prefix to trigger the pipeline:
+```bash
+./scripts/trigger.sh test-data.parquet
+```
+
+Or upload any Parquet file to the `feed/` prefix to trigger the pipeline:
 
 ```bash
-aws s3 cp test-data.parquet "s3://${DATA_BUCKET}/feed/test-data.parquet" --profile "$PROFILE"
+./scripts/trigger.sh path/to/your-file.parquet
 ```
 
 The state machine will start automatically via the EventBridge rule.
