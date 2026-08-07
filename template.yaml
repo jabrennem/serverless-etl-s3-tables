@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: Serverless ETL Application using state machine, emr serverless, lambda, event bridge and S3.
+
+Parameters:
+  PrincipalOrgId:
+    Type: String
+    Description: AWS Organization ID for org-scoped access conditions
+  LoggingBucketName:
+    Type: String
+    Description: Name of an existing S3 bucket to receive access logs
+  TableBucketName:
+    Type: String
+    Default: serverless-etl-table-bucket
+    Description: Name of the S3 Table Bucket for Iceberg tables
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    Tracing: Active
+    Architectures:
+      - arm64
+
+Resources:
+
+  # --- Encrypt our S3 Bucket contents ---
+
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for S3 Bucket
+      EnableKeyRotation: true
+
+  # --- Where the Parquet files are uploaded ---
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucketName
+        LogFilePrefix: !Sub "${AWS::StackName}/"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireNonCurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # --- Locking the Bucket down to SSL traffic within the Organization ---
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowOrganizationAccess
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref PrincipalOrgId
+
+  # --- Validate Input Lambda ---
+
+  ValidateInputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: validate_input.handler
+      CodeUri: lambda/validate_input/
+
+  # --- S3 Table Bucket (Managed Iceberg) ---
+
+  IcebergTableBucket:
+    Type: AWS::S3Tables::TableBucket
+    Properties:
+      TableBucketName: !Ref TableBucketName
+
+  # -- EMR Serverless Application --
+
+  EmrApp:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      ReleaseLabel: emr-7.8.0
+      Architecture: ARM64
+      Type: Spark
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 2
+
+  EmrAppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+
+  EmrAppPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref EmrAppRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ReadParquetFromDataBucket
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+          - Sid: WriteStatsToDataBucket
+            Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub "${DataBucket.Arn}/runs/*"
+          - Sid: EncryptDecryptDataBucket
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !GetAtt EncryptionKey.Arn
+          - Sid: WriteToTableBucket
+            Effect: Allow
+            Action:
+              - s3tables:CreateNamespace
+              - s3tables:CreateTable
+              - s3tables:UpdateTableMetadataLocation
+              - s3tables:PutTableData
+              - s3tables:GetTableMetadataLocation
+              - s3tables:GetTableData
+              - s3tables:GetNamespace
+              - s3tables:GetTable
+              - s3tables:ListTables
+              - s3tables:ListNamespaces
+            Resource:
+              - !GetAtt IcebergTableBucket.TableBucketARN
+              - !Sub "${IcebergTableBucket.TableBucketARN}/*"
+
+  # --- Load Data State Machine ---
+
+  StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Role: !GetAtt StateMachineRole.Arn
+      DefinitionUri: statemachine/load-data.asl.json
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogs.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionSubstitutions:
+        DataBucket: !Ref DataBucket
+        ValidateInputFunctionArn: !GetAtt ValidateInputFunction.Arn
+        EMRServerlessApplicationId: !Ref EmrApp
+        ExecutionRoleArn: !GetAtt EmrAppRole.Arn
+        PySparkScriptLocation: !Sub "s3://${DataBucket}/emr/load_data.py"
+        IcebergTableBucketName: !Ref TableBucketName
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StateMachinePolicy
+
+  StateMachinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: InvokeLambda
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt ValidateInputFunction.Arn
+          - Sid: EmrServerless
+            Effect: Allow
+            Action:
+              - emr-serverless:StartJobRun
+              - emr-serverless:GetJobRun
+              - emr-serverless:CancelJobRun
+            Resource:
+              - !Sub "arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/${EmrApp}"
+              - !Sub "arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/${EmrApp}/jobruns/*"
+          - Sid: PassEmrRole
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !GetAtt EmrAppRole.Arn
+          - Sid: XRay
+            Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutResourcePolicy
+              - logs:DescribeResourcePolicies
+              - logs:DescribeLogGroups
+            Resource: "*"
+          - Sid: EventBridge
+            Effect: Allow
+            Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+            Resource:
+              - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsFor*"
+          - Sid: PutEvents
+            Effect: Allow
+            Action:
+              - events:PutEvents
+            Resource:
+              - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+          - Sid: ReadStatsFromDataBucket
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              - !Sub "${DataBucket.Arn}/runs/*"
+          - Sid: DecryptStatsFromDataBucket
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+            Resource:
+              - !GetAtt EncryptionKey.Arn
+
+  StateMachineLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}-logs
+
+  # --- EventBridge Rule: S3 Object Created under feed/ → State Machine ---
+
+  FeedUploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers the ETL state machine when an object is created under feed/ in DataBucket
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref DataBucket
+          object:
+            key:
+              - prefix: "feed/"
+      Targets:
+        - Id: LoadDataStateMachine
+          Arn: !GetAtt StateMachine.Arn
+          RoleArn: !GetAtt EventBridgeStateMachineRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              key: $.detail.object.key
+            InputTemplate: |
+              {
+                "SourceFileTableNameMapping": [{"SourceFile": "<key>"}],
+                "Event": {"source": "aws.s3", "detail-type": "Object Created", "key": "<key>"}
+              }
+
+  EventBridgeStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachineExecution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !GetAtt StateMachine.Arn
+
+Outputs:
+  DataBucketName:
+    Description: Name of the S3 data bucket
+    Value: !Ref DataBucket

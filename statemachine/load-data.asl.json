@@ -1,0 +1,132 @@
+{
+    "Comment": "Serverless ETL state machine — runs per-table EMR Serverless Iceberg jobs.",
+    "QueryLanguage": "JSONata",
+    "StartAt": "Validate Input",
+    "States": {
+        "Validate Input": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": {
+                "FunctionName": "${ValidateInputFunctionArn}",
+                "Payload": "{% $states.input %}"
+            },
+            "Output": "{% $states.result.Payload %}",
+            "Next": "Load Tables"
+        },
+        "Load Tables": {
+            "Type": "Map",
+            "Items": "{% $states.input.SourceFileTableNameMapping %}",
+            "ItemProcessor": {
+                "ProcessorConfig": {
+                    "Mode": "INLINE"
+                },
+                "StartAt": "Load Data",
+                "States": {
+                    "Load Data": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::emr-serverless:startJobRun.sync",
+                        "Arguments": {
+                            "ApplicationId": "${EMRServerlessApplicationId}",
+                            "ExecutionRoleArn": "${ExecutionRoleArn}",
+                            "ClientToken": "{% $uuid() %}",
+                            "Name": "{% 'load-' & $states.input.TableName %}",
+                            "JobDriver": {
+                                "SparkSubmit": {
+                                    "EntryPoint": "${PySparkScriptLocation}",
+                                    "EntryPointArguments": "{% [ 's3://${DataBucket}/' & $states.input.SourceFile, '${IcebergTableBucketName}', 'default', $states.input.TableName, 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' ] %}",
+                                    "SparkSubmitParameters": "--conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.s3tablesbucket=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.s3tablesbucket.catalog-impl=software.amazon.s3tables.iceberg.S3TablesCatalog --conf spark.sql.catalog.s3tablesbucket.warehouse=${IcebergTableBucketName}"
+                                }
+                            }
+                        },
+                        "Retry": [
+                            {
+                                "ErrorEquals": [
+                                    "EmrServerless.EmrServerlessException",
+                                    "EMRServerless.AWSEMRServerlessException",
+                                    "EMRServerless.ValidationException"
+                                ],
+                                "IntervalSeconds": 15,
+                                "MaxAttempts": 10,
+                                "BackoffRate": 2
+                            }
+                        ],
+                        "Output": "{% $states.input %}",
+                        "Next": "Get Stats Object",
+                        "Catch": [{
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Fail Item",
+                            "Output": "{% $states.input %}"
+                        }]
+                    },
+                    "Get Stats Object": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                        "Arguments": {
+                            "Bucket": "${DataBucket}",
+                            "Key": "{% 'runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' %}"
+                        },
+                        "Output": "{% $parse($states.result.Body) %}",
+                        "Next": "Emit Job Complete",
+                        "Catch": [{
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Fail Item",
+                            "Output": "{% $states.input %}",
+                            "Comment": "Stats missing after successful EMR job — treat table as failed"
+                        }]
+                    },
+                    "Emit Job Complete": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::events:putEvents",
+                        "Arguments": {
+                            "Entries": [{
+                                "EventBusName": "default",
+                                "Source": "etl.pipeline",
+                                "DetailType": "TableLoadComplete",
+                                "Detail": {
+                                    "runId": "{% $states.context.Execution.Name %}",
+                                    "table": "{% $states.input.table %}",
+                                    "input": "{% $states.input.input %}",
+                                    "output": "{% $states.input.output %}",
+                                    "rowCount": "{% $states.input.rowCount %}"
+                                }
+                            }]
+                        },
+                        "Output": "{% $states.input %}",
+                        "Next": "Item Succeeded",
+                        "Catch": [{
+                            "ErrorEquals": ["States.ALL"],
+                            "Next": "Item Succeeded",
+                            "Comment": "Event emission failure is non-fatal"
+                        }]
+                    },
+                    "Item Succeeded": {
+                        "Type": "Pass",
+                        "Output": "{% { 'status': 'succeeded', 'table': $states.input.table, 'rowCount': $states.input.rowCount } %}",
+                        "End": true
+                    },
+                    "Fail Item": {
+                        "Type": "Pass",
+                        "Output": "{% { 'status': 'failed', 'table': $states.input.TableName } %}",
+                        "End": true
+                    }
+                }
+            },
+            "Output": "{% $states.result %}",
+            "Next": "Check Table Results"
+        },
+        "Check Table Results": {
+            "Type": "Choice",
+            "Choices": [{
+                "Condition": "{% $count($states.input[status = 'failed']) > 0 %}",
+                "Next": "Fail"
+            }],
+            "Default": "Succeed"
+        },
+        "Succeed": {
+            "Type": "Succeed"
+        },
+        "Fail": {
+            "Type": "Fail"
+        }
+    }
+}

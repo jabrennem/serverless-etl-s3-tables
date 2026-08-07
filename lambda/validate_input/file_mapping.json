@@ -1,0 +1,5 @@
+{
+    "mappings": [
+        {"tableName": "test_data", "filePattern": ".*/test-data\\.parquet$"}
+    ]
+}
