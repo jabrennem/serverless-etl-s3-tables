@@ -25,6 +25,7 @@
                     "Load Data": {
                         "Type": "Task",
                         "Resource": "arn:aws:states:::emr-serverless:startJobRun.sync",
+                        "TimeoutSeconds": 600,
                         "Arguments": {
                             "ApplicationId": "${EMRServerlessApplicationId}",
                             "ExecutionRoleArn": "${ExecutionRoleArn}",

@@ -46,22 +46,20 @@ flowchart LR
 
 ## Build and Deploy
 
-Set `AWS_PROFILE` to override the default profile (`dev`).
+First, open `samconfig.yaml` and fill in the `parameter_overrides` for your environment:
 
-```bash
-AWS_PROFILE=profile_name
+```yaml
+parameter_overrides:
+  - PrincipalOrgId=o-xxxxxxxxxx          # your AWS Organization ID
+  - LoggingBucketName=my-logging-bucket  # existing S3 bucket for access logs
 ```
 
-Build and deploy
+To use a non-default AWS profile, export `AWS_PROFILE` before running the commands.
 
 ```bash
+export AWS_PROFILE=profile_name
 sam build
 sam deploy
-```
-
-Then run the post-deploy script to upload the PySpark script and apply Lake Formation grants:
-
-```bash
 ./scripts/post-deploy.sh
 ```
 

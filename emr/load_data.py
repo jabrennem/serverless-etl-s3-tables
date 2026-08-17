@@ -1,10 +1,11 @@
 import json
 import sys
-import urllib.parse
+
 from pyspark.sql import SparkSession
 
 
 def _write_stats_file(
+    spark: SparkSession,
     stats_s3_uri: str,
     input_path: str,
     catalog_id: str,
@@ -12,20 +13,23 @@ def _write_stats_file(
     table_name: str,
     row_count: int,
 ) -> None:
-    """Write per-table run stats to S3 for the state machine's Read Run Stats step."""
+    """Write per-table run stats as JSON to S3 via Spark's Hadoop filesystem.
+
+    Uses EMRFS (the same S3 client Spark uses for reads/writes) rather than
+    boto3, which cannot reach S3 from the EMR Serverless driver container.
+    """
     try:
-        import boto3
-        parsed = urllib.parse.urlparse(stats_s3_uri)
-        boto3.client("s3").put_object(
-            Bucket=parsed.netloc,
-            Key=parsed.path.lstrip("/"),
-            Body=json.dumps({
-                "table": table_name,
-                "rowCount": row_count,
-                "input": input_path.removeprefix("s3://"),
-                "output": f"{catalog_id}/{namespace}.{table_name}",
-            }).encode(),
-        )
+        stats = json.dumps({
+            "table": table_name,
+            "rowCount": row_count,
+            "input": input_path.removeprefix("s3://"),
+            "output": f"{catalog_id}/{namespace}.{table_name}",
+        })
+        path = spark._jvm.org.apache.hadoop.fs.Path(stats_s3_uri)
+        fs = path.getFileSystem(spark._jsc.hadoopConfiguration())
+        out = fs.create(path, True)
+        out.write(bytearray(stats.encode()))
+        out.close()
         print(f"Stats written to {stats_s3_uri} ({row_count} rows)")
     except Exception as e:
         print(f"Warning: failed to write stats file: {e}")
@@ -69,7 +73,7 @@ def main(input_path: str, catalog_id: str, namespace: str,
     print(f"Data successfully written to '{iceberg_table}' ({count} rows)")
 
     if stats_s3_uri:
-        _write_stats_file(stats_s3_uri, input_path, catalog_id, namespace, table_name, count)
+        _write_stats_file(spark, stats_s3_uri, input_path, catalog_id, namespace, table_name, count)
 
     spark.stop()
     return 0

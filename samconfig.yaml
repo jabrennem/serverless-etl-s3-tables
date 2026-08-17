@@ -5,7 +5,6 @@ default:
       stack_name: serverless-etl-s3-to-iceberg
       region: us-east-2
       resolve_s3: true
-      profile: default
       capabilities:
         - CAPABILITY_NAMED_IAM
       parameter_overrides:

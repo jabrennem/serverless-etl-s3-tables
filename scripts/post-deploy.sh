@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROFILE="${AWS_PROFILE:-dev}"
+usage() {
+  echo "Usage: $0 [--profile <aws-profile>]"
+  exit 1
+}
+
+PROFILE="${AWS_PROFILE:-default}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      PROFILE="$2"
+      shift 2
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+
 STACK_NAME="serverless-etl-s3-to-iceberg"
 TABLE_BUCKET_NAME="serverless-etl-table-bucket"
 
