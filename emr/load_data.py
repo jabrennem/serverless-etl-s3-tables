@@ -67,10 +67,10 @@ def main(input_path: str, catalog_id: str, namespace: str,
     print(f"Found {count} records")
     df.printSchema()
 
-    # Write data — overwrite the pre-existing table
-    df.createOrReplaceTempView("source_data")
-    spark.sql(f"INSERT OVERWRITE {iceberg_table} SELECT * FROM source_data")
-    print(f"Data successfully written to '{iceberg_table}' ({count} rows)")
+    # Append the source rows to the existing Iceberg table. DataFrameWriterV2
+    # resolves columns by name and makes the write intent explicit.
+    df.writeTo(iceberg_table).append()
+    print(f"Data successfully appended to '{iceberg_table}' ({count} rows)")
 
     if stats_s3_uri:
         _write_stats_file(spark, stats_s3_uri, input_path, catalog_id, namespace, table_name, count)
