@@ -35,7 +35,7 @@ flowchart LR
 
 | Service | Role |
 |---------|------|
-| Step Functions | Orchestrates validation → parallel EMR jobs → stats collection → EventBridge notification |
+| Step Functions | Orchestrates validation → parallel EMR jobs → stats availability check → EventBridge notification |
 | EventBridge | Triggers the state machine when a file lands in `feed/` |
 
 ## Requirements

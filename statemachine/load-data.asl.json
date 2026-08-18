@@ -52,27 +52,27 @@
                             }
                         ],
                         "Output": "{% $states.input %}",
-                        "Next": "Get Stats Object",
+                        "Next": "Check Stats Object",
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
                             "Next": "Fail Item",
                             "Output": "{% $states.input %}"
                         }]
                     },
-                    "Get Stats Object": {
+                    "Check Stats Object": {
                         "Type": "Task",
-                        "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                        "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
                         "Arguments": {
                             "Bucket": "${DataBucket}",
                             "Key": "{% 'runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' %}"
                         },
-                        "Output": "{% $parse($states.result.Body) %}",
+                        "Output": "{% $merge([$states.input, { 'stats': { 'status': 'available', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' } }]) %}",
                         "Next": "Emit Job Complete",
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
-                            "Next": "Fail Item",
-                            "Output": "{% $states.input %}",
-                            "Comment": "Stats missing after successful EMR job — treat table as failed"
+                            "Next": "Emit Job Complete",
+                            "Output": "{% $merge([$states.input, { 'stats': { 'status': 'unavailable', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' } }]) %}",
+                            "Comment": "Stats are optional telemetry; a missing object does not fail a committed table load"
                         }]
                     },
                     "Emit Job Complete": {
@@ -85,10 +85,12 @@
                                 "DetailType": "TableLoadComplete",
                                 "Detail": {
                                     "runId": "{% $states.context.Execution.Name %}",
-                                    "table": "{% $states.input.table %}",
-                                    "input": "{% $states.input.input %}",
-                                    "output": "{% $states.input.output %}",
-                                    "rowCount": "{% $states.input.rowCount %}"
+                                    "table": "{% $states.input.TableName %}",
+                                    "sourceFile": "{% $states.input.SourceFile %}",
+                                    "stats": {
+                                        "status": "{% $states.input.stats.status %}",
+                                        "uri": "{% $states.input.stats.uri %}"
+                                    }
                                 }
                             }]
                         },
@@ -97,12 +99,13 @@
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
                             "Next": "Item Succeeded",
+                            "Output": "{% $states.input %}",
                             "Comment": "Event emission failure is non-fatal"
                         }]
                     },
                     "Item Succeeded": {
                         "Type": "Pass",
-                        "Output": "{% { 'status': 'succeeded', 'table': $states.input.table, 'rowCount': $states.input.rowCount } %}",
+                        "Output": "{% { 'status': 'succeeded', 'table': $states.input.TableName, 'stats': $states.input.stats } %}",
                         "End": true
                     },
                     "Fail Item": {
