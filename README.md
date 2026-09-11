@@ -117,5 +117,7 @@ Expect:
 - a single job writing to **both** tables (proving multi-table-per-job).
 
 Watch the run in the Step Functions console, then preview the loaded rows using the
-preview button on the S3 Table page. Because each row carries its `source_file`, 
-re-running a failed execution is safe — the loader `MERGE`s on that key, so already-loaded files insert nothing.
+preview button on the S3 Table page. Because each row carries its `source_file`,
+re-running a failed execution is safe — for each file the loader checks whether that
+`source_file` is already in the table and appends only if it is not, so already-loaded
+files are skipped.
