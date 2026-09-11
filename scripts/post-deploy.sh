@@ -44,25 +44,35 @@ EMR_ROLE=$(aws cloudformation describe-stack-resource \
 EMR_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${EMR_ROLE}"
 CATALOG_ID="${ACCOUNT_ID}:s3tablescatalog/${TABLE_BUCKET_NAME}"
 
+# Iceberg tables to grant on (must match the TableName values in template.yaml).
+TABLES=(customers test_data)
+
 # Catalog-level
 aws lakeformation grant-permissions \
   --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
   --resource "{\"Catalog\":{\"Id\":\"${CATALOG_ID}\"}}" \
   --permissions '["CREATE_DATABASE", "DESCRIBE"]' \
-  --profile "$PROFILE" 2>/dev/null || true
+  --profile "$PROFILE"
 
 # Database-level (default namespace)
 aws lakeformation grant-permissions \
   --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
   --resource "{\"Database\":{\"CatalogId\":\"${CATALOG_ID}\",\"Name\":\"default\"}}" \
   --permissions '["DESCRIBE", "ALTER", "CREATE_TABLE"]' \
-  --profile "$PROFILE" 2>/dev/null || true
+  --profile "$PROFILE"
 
-# Table-level (all tables in default namespace)
-aws lakeformation grant-permissions \
-  --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
-  --resource "{\"Table\":{\"CatalogId\":\"${CATALOG_ID}\",\"DatabaseName\":\"default\",\"TableWildcard\":{}}}" \
-  --permissions '["SELECT", "INSERT", "DESCRIBE", "ALTER", "DROP"]' \
-  --profile "$PROFILE" 2>/dev/null || true
+# Table-level, granted by explicit name. ALL (SUPER) is required for EMR to
+# WRITE S3 Tables data — INSERT alone is insufficient for the Iceberg commit's
+# read-modify-write against the underlying S3 storage, and it surfaces as a raw
+# S3 403 on the write/abort path. A TableWildcard grant does not reliably
+# register against the S3 Tables federated catalog, so grant per table.
+for T in "${TABLES[@]}"; do
+  echo "  granting ALL on table ${T}"
+  aws lakeformation grant-permissions \
+    --principal "DataLakePrincipalIdentifier=${EMR_ROLE_ARN}" \
+    --resource "{\"Table\":{\"CatalogId\":\"${CATALOG_ID}\",\"DatabaseName\":\"default\",\"Name\":\"${T}\"}}" \
+    --permissions '["ALL"]' \
+    --profile "$PROFILE"
+done
 
 echo "Done. Data bucket: ${DATA_BUCKET}"

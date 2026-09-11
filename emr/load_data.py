@@ -53,10 +53,11 @@ def main(batch_json, catalog_id: str, namespace: str, stats_s3_uri: str = "") ->
 
     A single EMR Serverless job — one Spark session — processes every file in the
     group, amortizing the per-job startup cost across the batch. Each file is
-    loaded into its own Iceberg table via an independent, atomic MERGE keyed on
-    the file's S3 key (source_file), so re-running a file that already committed
-    inserts nothing. One job run may write to several different tables, and a
-    group retry is safe (no double-append) without any external ledger.
+    loaded into its own Iceberg table: before appending, the table is checked for
+    the file's S3 key (source_file), and the append is skipped if it is already
+    present. Re-running a state machine after a partial failure re-sends the same
+    file list, so already-committed files are skipped rather than double-appended.
+    One job run may write to several different tables.
 
     Args:
         batch_json: JSON array (or JSON string of one) of
@@ -105,19 +106,32 @@ def main(batch_json, catalog_id: str, namespace: str, stats_s3_uri: str = "") ->
                 .withColumn("source_file", lit(source_uri))
             )
 
-            # Idempotent load: MERGE on source_file so re-running a file that
-            # already committed is a no-op. Iceberg's MERGE is a single atomic
-            # commit — this is what makes a Step Functions group retry safe
-            # (no double-append) without any external ledger/dual-write.
-            view = f"src_{table_name}"
-            df.createOrReplaceTempView(view)
-            spark.sql(
-                f"MERGE INTO {iceberg_table} t "
-                f"USING {view} s "
-                f"ON t.source_file = s.source_file "
-                f"WHEN NOT MATCHED THEN INSERT *"
-            )
-            print(f"  merged {count} rows into '{iceberg_table}' (key: {source_uri})")
+            # Idempotent load: check whether this file's rows are already in the
+            # table (keyed on source_file), and append only if not. Re-running a
+            # state machine after a partial failure re-sends the same file list,
+            # so already-committed files are skipped and never double-appended.
+            # A plain SELECT (LF SELECT works) + append (write path that works)
+            # avoids the MERGE write-commit credential path that 403'd on this
+            # S3 Tables + Lake Formation setup. Predicate on source_file lets
+            # Iceberg prune by column stats rather than scan the whole table.
+            escaped_uri = source_uri.replace("'", "''")
+            already_loaded = spark.sql(
+                f"SELECT 1 FROM {iceberg_table} "
+                f"WHERE source_file = '{escaped_uri}' LIMIT 1"
+            ).count() > 0
+
+            if already_loaded:
+                print(f"  skip {source_uri} — already loaded into '{iceberg_table}'")
+                results.append({
+                    "table": table_name,
+                    "input": input_path.removeprefix("s3://"),
+                    "rowCount": 0,
+                    "status": "skipped",
+                })
+                continue
+
+            df.writeTo(iceberg_table).append()
+            print(f"  appended {count} rows to '{iceberg_table}' (key: {source_uri})")
 
             results.append({
                 "table": table_name,
