@@ -1,34 +1,28 @@
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "description": "User defined input for the LoadDataToIceberg StateMachine",
-    "required": ["SourceFileTableNameMapping"],
-    "properties": {
-        "SourceFileTableNameMapping": {
-            "description": "Explicit list of source file to table name mappings",
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "required": ["SourceFile"],
-                "properties": {
-                    "SourceFile": {
-                        "description": "S3 object key (not full URI) of the source file.",
-                        "type": "string",
-                        "minLength": 1
-                    },
-                    "TableName": {
-                        "type": "string",
-                        "minLength": 1
-                    }
-                },
-                "additionalProperties": false
+    "type": "array",
+    "description": "Flat list of enriched parquet files for the LoadData StateMachine. Table names are resolved by the Pipe enrichment Lambda; Size is optional and backfilled via boto3 when absent (e.g. manual runs).",
+    "minItems": 1,
+    "items": {
+        "type": "object",
+        "required": ["SourceFile", "TableName"],
+        "properties": {
+            "SourceFile": {
+                "description": "S3 object key (not full URI) of the source file.",
+                "type": "string",
+                "minLength": 1
+            },
+            "TableName": {
+                "description": "Target Iceberg table name resolved from the file name.",
+                "type": "string",
+                "minLength": 1
+            },
+            "Size": {
+                "description": "Object size in bytes (from the S3 event). Optional — backfilled via HeadObject when omitted.",
+                "type": "integer",
+                "minimum": 0
             }
         },
-        "Event": {
-            "description": "Original EventBridge event metadata — passed through for auditing only",
-            "type": "object"
-        }
-    },
-    "additionalProperties": false
+        "additionalProperties": false
+    }
 }

@@ -1,88 +1,153 @@
 import json
 import sys
+from datetime import datetime, timezone
 
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit
+from pyspark.sql.types import TimestampType
 
 
-def _write_stats_file(
-    spark: SparkSession,
-    stats_s3_uri: str,
-    input_path: str,
-    catalog_id: str,
-    namespace: str,
-    table_name: str,
-    row_count: int,
-) -> None:
-    """Write per-table run stats as JSON to S3 via Spark's Hadoop filesystem.
+def _write_stats_file(spark: SparkSession, stats_s3_uri: str, results: list) -> None:
+    """Write per-group run stats as JSON to S3 via Spark's Hadoop filesystem.
 
     Uses EMRFS (the same S3 client Spark uses for reads/writes) rather than
     boto3, which cannot reach S3 from the EMR Serverless driver container.
     """
     try:
-        stats = json.dumps({
-            "table": table_name,
-            "rowCount": row_count,
-            "input": input_path.removeprefix("s3://"),
-            "output": f"{catalog_id}/{namespace}.{table_name}",
-        })
+        stats = json.dumps({"files": results, "fileCount": len(results)})
         path = spark._jvm.org.apache.hadoop.fs.Path(stats_s3_uri)
         fs = path.getFileSystem(spark._jsc.hadoopConfiguration())
         out = fs.create(path, True)
         out.write(bytearray(stats.encode()))
         out.close()
-        print(f"Stats written to {stats_s3_uri} ({row_count} rows)")
+        print(f"Stats written to {stats_s3_uri} ({len(results)} files)")
     except Exception as e:
         print(f"Warning: failed to write stats file: {e}")
 
 
-def main(input_path: str, catalog_id: str, namespace: str,
-         table_name: str, stats_s3_uri: str = "") -> int:
-    """Load a Parquet file from S3 into an S3 Table Bucket (managed Iceberg) via Glue REST catalog.
+def _parse_batch(batch_arg):
+    """Coerce the batch argument into a list of {SourceFile, TableName} dicts.
+
+    Step Functions may hand us the batch already decoded (a list), a JSON string,
+    or — depending on how JSONata stringifies it — a JSON string that itself
+    decodes to another JSON string (double-encoded). Decode until we have a list.
+    """
+    val = batch_arg
+    # Decode JSON strings, tolerating one or more layers of encoding.
+    for _ in range(3):
+        if isinstance(val, str):
+            val = json.loads(val)
+        else:
+            break
+    # A single-file group may arrive as a bare object rather than a 1-element
+    # array (e.g. JSONata's $map over a one-item sequence). Coerce to a list.
+    if isinstance(val, dict):
+        val = [val]
+    if not isinstance(val, list):
+        raise ValueError(f"Expected a list of file items, got {type(val).__name__}: {val!r}")
+    return val
+
+
+def main(batch_json, catalog_id: str, namespace: str, stats_s3_uri: str = "") -> int:
+    """Load a batch of Parquet files into an S3 Table Bucket (managed Iceberg) in ONE job.
+
+    A single EMR Serverless job — one Spark session — processes every file in the
+    group, amortizing the per-job startup cost across the batch. Each file is
+    loaded into its own Iceberg table via an independent, atomic MERGE keyed on
+    the file's S3 key (source_file), so re-running a file that already committed
+    inserts nothing. One job run may write to several different tables, and a
+    group retry is safe (no double-append) without any external ledger.
 
     Args:
-        input_path: S3 path to the source Parquet file.
+        batch_json: JSON array (or JSON string of one) of
+            {"SourceFile": <s3 uri>, "TableName": <table>} items.
         catalog_id: Glue catalog ID for the S3 Table Bucket (e.g. 123456789012:s3tablescatalog/bucket-name).
         namespace: Namespace within the table bucket.
-        table_name: Name of the target table.
         stats_s3_uri: S3 URI to write run stats JSON (optional).
 
     Returns:
-        0 on success.
+        0 if every file committed; 1 if any file failed (after attempting all).
     """
-    iceberg_table = f"s3tablesbucket.{namespace}.{table_name}"
+    batch = _parse_batch(batch_json)
+    print(f"Batch of {len(batch)} file(s) into catalog {catalog_id}")
 
-    print(f"Loading {input_path} into {iceberg_table}")
-    print(f"Glue catalog ID: {catalog_id}")
+    # One ingestion timestamp for the whole job run — every row loaded by this
+    # job carries the same ingest_datetime, marking when the batch was ingested.
+    ingest_dt = datetime.now(timezone.utc)
+    print(f"ingest_datetime for this run: {ingest_dt.isoformat()}")
 
     spark = (
         SparkSession.builder
-        .appName(f"S3TableBucket-Import-{table_name}")
+        .appName(f"S3TableBucket-Batch-{len(batch)}files")
         .getOrCreate()
     )
 
-    df = spark.read.parquet(input_path)
-    print(f"Read Parquet file: {input_path}")
+    results = []
+    failed = False
 
-    count = df.count()
-    print(f"Found {count} records")
-    df.printSchema()
+    for item in batch:
+        input_path = item["SourceFile"]
+        table_name = item["TableName"]
+        iceberg_table = f"s3tablesbucket.{namespace}.{table_name}"
 
-    # Append the source rows to the existing Iceberg table. DataFrameWriterV2
-    # resolves columns by name and makes the write intent explicit.
-    df.writeTo(iceberg_table).append()
-    print(f"Data successfully appended to '{iceberg_table}' ({count} rows)")
+        try:
+            print(f"Loading {input_path} into {iceberg_table}")
+            df = spark.read.parquet(input_path)
+            count = df.count()
+            print(f"  read {count} records")
+
+            # Stamp every row with the batch-run ingestion time (audit column)
+            # and the full source S3 URI (idempotency + lineage key).
+            source_uri = input_path  # s3://bucket/feed/....parquet
+            df = (
+                df
+                .withColumn("ingest_datetime", lit(ingest_dt).cast(TimestampType()))
+                .withColumn("source_file", lit(source_uri))
+            )
+
+            # Idempotent load: MERGE on source_file so re-running a file that
+            # already committed is a no-op. Iceberg's MERGE is a single atomic
+            # commit — this is what makes a Step Functions group retry safe
+            # (no double-append) without any external ledger/dual-write.
+            view = f"src_{table_name}"
+            df.createOrReplaceTempView(view)
+            spark.sql(
+                f"MERGE INTO {iceberg_table} t "
+                f"USING {view} s "
+                f"ON t.source_file = s.source_file "
+                f"WHEN NOT MATCHED THEN INSERT *"
+            )
+            print(f"  merged {count} rows into '{iceberg_table}' (key: {source_uri})")
+
+            results.append({
+                "table": table_name,
+                "input": input_path.removeprefix("s3://"),
+                "output": f"{catalog_id}/{namespace}.{table_name}",
+                "rowCount": count,
+                "ingestDatetime": ingest_dt.isoformat(),
+                "status": "succeeded",
+            })
+        except Exception as e:  # noqa: BLE001 — attempt every file, report per-file
+            failed = True
+            print(f"  FAILED {input_path} -> {iceberg_table}: {e}")
+            results.append({
+                "table": table_name,
+                "input": input_path.removeprefix("s3://"),
+                "status": "failed",
+                "error": str(e),
+            })
 
     if stats_s3_uri:
-        _write_stats_file(spark, stats_s3_uri, input_path, catalog_id, namespace, table_name, count)
+        _write_stats_file(spark, stats_s3_uri, results)
 
     spark.stop()
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
     print(sys.argv)
-    if len(sys.argv) < 5:
-        print("Usage: load_data.py <input_path> <catalog_id> <namespace> <table_name> [stats_s3_uri]")
+    if len(sys.argv) < 4:
+        print("Usage: load_data.py <batch_json> <catalog_id> <namespace> [stats_s3_uri]")
         sys.exit(1)
-    stats_s3_uri = sys.argv[5] if len(sys.argv) > 5 else ""
-    sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], stats_s3_uri))
+    stats_s3_uri = sys.argv[4] if len(sys.argv) > 4 else ""
+    sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3], stats_s3_uri))

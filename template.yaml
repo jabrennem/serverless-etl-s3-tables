@@ -14,6 +14,10 @@ Parameters:
     Type: String
     Default: serverless-etl-table-bucket
     Description: Name of the S3 Table Bucket for Iceberg tables
+  BatchSizeThresholdBytes:
+    Type: String
+    Default: "10000"
+    Description: Max bytes packed into one EMR job. Low (10 KB) for the tiny demo files; raise for real data.
 
 Globals:
   Function:
@@ -100,13 +104,66 @@ Resources:
               StringEquals:
                 aws:PrincipalOrgID: !Ref PrincipalOrgId
 
-  # --- Validate Input Lambda ---
+  # --- Message Poller Lambda (scheduled: drain queue -> start state machine) ---
+
+  MessagePollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: message_poller.handler
+      CodeUri: lambda/message_poller/
+      Timeout: 60
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref IngestQueue
+          STATE_MACHINE_ARN: !GetAtt StateMachine.Arn
+      Policies:
+        - Statement:
+            - Sid: DrainQueue
+              Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt IngestQueue.Arn
+            - Sid: StartStateMachine
+              Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !GetAtt StateMachine.Arn
+      Events:
+        Poll:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(2 minutes)
+            Description: Periodically drains the ingest queue and starts the ETL state machine
+
+  # --- Validate Input Lambda (size-grouping) ---
 
   ValidateInputFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: validate_input.handler
       CodeUri: lambda/validate_input/
+      Environment:
+        Variables:
+          BATCH_SIZE_THRESHOLD_BYTES: !Ref BatchSizeThresholdBytes
+          DATA_BUCKET: !Ref DataBucket
+      Policies:
+        - Statement:
+            - Sid: HeadObjectForSizeBackfill
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !GetAtt DataBucket.Arn
+                - !Sub "${DataBucket.Arn}/*"
+            - Sid: DecryptForHeadObject
+              Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource:
+                - !GetAtt EncryptionKey.Arn
 
   # --- S3 Table Bucket (Managed Iceberg) ---
 
@@ -140,6 +197,39 @@ Resources:
               Required: false
             - Name: amount
               Type: double
+              Required: false
+            - Name: ingest_datetime
+              Type: timestamp
+              Required: false
+            - Name: source_file
+              Type: string
+              Required: false
+
+  IcebergCustomersTable:
+    Type: AWS::S3Tables::Table
+    DependsOn: IcebergDefaultNamespace
+    Properties:
+      TableBucketARN: !GetAtt IcebergTableBucket.TableBucketARN
+      Namespace: default
+      TableName: customers
+      OpenTableFormat: ICEBERG
+      IcebergMetadata:
+        IcebergSchema:
+          SchemaFieldList:
+            - Name: customer_id
+              Type: long
+              Required: true
+            - Name: email
+              Type: string
+              Required: false
+            - Name: region
+              Type: string
+              Required: false
+            - Name: ingest_datetime
+              Type: timestamp
+              Required: false
+            - Name: source_file
+              Type: string
               Required: false
 
   # -- EMR Serverless Application --
@@ -353,12 +443,47 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/vendedlogs/states/${AWS::StackName}-logs
 
-  # --- EventBridge Rule: S3 Object Created under feed/ → State Machine ---
+  # --- Ingest Queue: buffers S3 object-created events so the Pipe can batch them ---
+
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 120  # 2 min
+      SqsManagedSseEnabled: true
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900  # >= the Pipe/state-machine start latency budget
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 5
+
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt FeedUploadRule.Arn
+
+  # --- EventBridge Rule: S3 Object Created under feed/ → Ingest Queue ---
 
   FeedUploadRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Triggers the ETL state machine when an object is created under feed/ in DataBucket
+      Description: Enqueues an object-created event when a file lands under feed/ in DataBucket
       State: ENABLED
       EventPattern:
         source:
@@ -373,40 +498,18 @@ Resources:
             key:
               - prefix: "feed/"
       Targets:
-        - Id: LoadDataStateMachine
-          Arn: !GetAtt StateMachine.Arn
-          RoleArn: !GetAtt EventBridgeStateMachineRole.Arn
-          InputTransformer:
-            InputPathsMap:
-              key: $.detail.object.key
-            InputTemplate: |
-              {
-                "SourceFileTableNameMapping": [{"SourceFile": "<key>"}],
-                "Event": {"source": "aws.s3", "detail-type": "Object Created", "key": "<key>"}
-              }
+        - Id: IngestQueue
+          Arn: !GetAtt IngestQueue.Arn
 
-  EventBridgeStateMachineRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: StartStateMachineExecution
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Effect: Allow
-                Action:
-                  - states:StartExecution
-                Resource:
-                  - !GetAtt StateMachine.Arn
+  # --- EventBridge Pipe: polls the queue in batches of 5 → state machine ---
 
 Outputs:
   DataBucketName:
     Description: Name of the S3 data bucket
     Value: !Ref DataBucket
+  IngestQueueUrl:
+    Description: URL of the SQS ingest queue that buffers S3 object-created events
+    Value: !Ref IngestQueue
+  IngestDLQUrl:
+    Description: URL of the dead-letter queue for events that fail processing 5 times
+    Value: !Ref IngestDLQ

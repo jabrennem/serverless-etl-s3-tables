@@ -1,0 +1,6 @@
+{
+    "mappings": [
+        {"tableName": "test_data", "filePattern": ".*/test-data(-[A-Za-z0-9]+)*\\.parquet$"},
+        {"tableName": "customers", "filePattern": ".*/customers(-[A-Za-z0-9]+)*\\.parquet$"}
+    ]
+}

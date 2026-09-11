@@ -1,5 +1,5 @@
 {
-    "Comment": "Serverless ETL state machine — runs per-table EMR Serverless Iceberg jobs.",
+    "Comment": "Serverless ETL state machine — runs one EMR Serverless Iceberg job per bin-packed group of files.",
     "QueryLanguage": "JSONata",
     "StartAt": "Validate Input",
     "States": {
@@ -11,11 +11,11 @@
                 "Payload": "{% $states.input %}"
             },
             "Output": "{% $states.result.Payload %}",
-            "Next": "Load Tables"
+            "Next": "Load Groups"
         },
-        "Load Tables": {
+        "Load Groups": {
             "Type": "Map",
-            "Items": "{% $states.input.SourceFileTableNameMapping %}",
+            "Items": "{% $states.input.Groups %}",
             "ItemProcessor": {
                 "ProcessorConfig": {
                     "Mode": "INLINE"
@@ -30,11 +30,11 @@
                             "ApplicationId": "${EMRServerlessApplicationId}",
                             "ExecutionRoleArn": "${ExecutionRoleArn}",
                             "ClientToken": "{% $uuid() %}",
-                            "Name": "{% 'load-' & $states.input.TableName %}",
+                            "Name": "{% 'iceberg-load-batch-' & $states.context.Execution.Name & '-grp' & $string($states.input.GroupIndex) & '-' & $string($count($states.input.SourceFileTableNameMapping)) & 'files' %}",
                             "JobDriver": {
                                 "SparkSubmit": {
                                     "EntryPoint": "${PySparkScriptLocation}",
-                                    "EntryPointArguments": "{% [ 's3://${DataBucket}/' & $states.input.SourceFile, '${GlueCatalogId}', 'default', $states.input.TableName, 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' ] %}",
+                                    "EntryPointArguments": "{% [ $string([$map($states.input.SourceFileTableNameMapping, function($m) { { 'SourceFile': 's3://${DataBucket}/' & $m.SourceFile, 'TableName': $m.TableName } })]), '${GlueCatalogId}', 'default', 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/grp' & $string($states.input.GroupIndex) & '.json' ] %}",
                                     "SparkSubmitParameters": "--conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.s3tablesbucket=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.s3tablesbucket.type=rest --conf spark.sql.catalog.s3tablesbucket.uri=https://glue.${AWS::Region}.amazonaws.com/iceberg --conf spark.sql.catalog.s3tablesbucket.warehouse=${GlueCatalogId} --conf spark.sql.catalog.s3tablesbucket.rest.sigv4-enabled=true --conf spark.sql.catalog.s3tablesbucket.rest.signing-name=glue --conf spark.sql.catalog.s3tablesbucket.rest.signing-region=${AWS::Region}"
                                 }
                             }
@@ -55,7 +55,7 @@
                         "Next": "Check Stats Object",
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
-                            "Next": "Fail Item",
+                            "Next": "Group Failed",
                             "Output": "{% $states.input %}"
                         }]
                     },
@@ -64,15 +64,15 @@
                         "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
                         "Arguments": {
                             "Bucket": "${DataBucket}",
-                            "Key": "{% 'runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' %}"
+                            "Key": "{% 'runs/' & $states.context.Execution.Name & '/stats/grp' & $string($states.input.GroupIndex) & '.json' %}"
                         },
-                        "Output": "{% $merge([$states.input, { 'stats': { 'status': 'available', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' } }]) %}",
+                        "Output": "{% $merge([$states.input, { 'stats': { 'status': 'available', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/grp' & $string($states.input.GroupIndex) & '.json' } }]) %}",
                         "Next": "Emit Job Complete",
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
                             "Next": "Emit Job Complete",
-                            "Output": "{% $merge([$states.input, { 'stats': { 'status': 'unavailable', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/' & $states.input.TableName & '.json' } }]) %}",
-                            "Comment": "Stats are optional telemetry; a missing object does not fail a committed table load"
+                            "Output": "{% $merge([$states.input, { 'stats': { 'status': 'unavailable', 'uri': 's3://${DataBucket}/runs/' & $states.context.Execution.Name & '/stats/grp' & $string($states.input.GroupIndex) & '.json' } }]) %}",
+                            "Comment": "Stats are optional telemetry; a missing object does not fail a committed group"
                         }]
                     },
                     "Emit Job Complete": {
@@ -82,11 +82,13 @@
                             "Entries": [{
                                 "EventBusName": "default",
                                 "Source": "etl.pipeline",
-                                "DetailType": "TableLoadComplete",
+                                "DetailType": "GroupLoadComplete",
                                 "Detail": {
                                     "runId": "{% $states.context.Execution.Name %}",
-                                    "table": "{% $states.input.TableName %}",
-                                    "sourceFile": "{% $states.input.SourceFile %}",
+                                    "groupIndex": "{% $states.input.GroupIndex %}",
+                                    "fileCount": "{% $count($states.input.SourceFileTableNameMapping) %}",
+                                    "totalSize": "{% $states.input.TotalSize %}",
+                                    "tableCount": "{% $states.input.TableCount %}",
                                     "stats": {
                                         "status": "{% $states.input.stats.status %}",
                                         "uri": "{% $states.input.stats.uri %}"
@@ -95,30 +97,30 @@
                             }]
                         },
                         "Output": "{% $states.input %}",
-                        "Next": "Item Succeeded",
+                        "Next": "Group Succeeded",
                         "Catch": [{
                             "ErrorEquals": ["States.ALL"],
-                            "Next": "Item Succeeded",
+                            "Next": "Group Succeeded",
                             "Output": "{% $states.input %}",
                             "Comment": "Event emission failure is non-fatal"
                         }]
                     },
-                    "Item Succeeded": {
+                    "Group Succeeded": {
                         "Type": "Pass",
-                        "Output": "{% { 'status': 'succeeded', 'table': $states.input.TableName, 'stats': $states.input.stats } %}",
+                        "Output": "{% { 'status': 'succeeded', 'groupIndex': $states.input.GroupIndex, 'fileCount': $count($states.input.SourceFileTableNameMapping), 'stats': $states.input.stats } %}",
                         "End": true
                     },
-                    "Fail Item": {
+                    "Group Failed": {
                         "Type": "Pass",
-                        "Output": "{% { 'status': 'failed', 'table': $states.input.TableName } %}",
+                        "Output": "{% { 'status': 'failed', 'groupIndex': $states.input.GroupIndex } %}",
                         "End": true
                     }
                 }
             },
             "Output": "{% $states.result %}",
-            "Next": "Check Table Results"
+            "Next": "Check Group Results"
         },
-        "Check Table Results": {
+        "Check Group Results": {
             "Type": "Choice",
             "Choices": [{
                 "Condition": "{% $count($states.input[status = 'failed']) > 0 %}",
